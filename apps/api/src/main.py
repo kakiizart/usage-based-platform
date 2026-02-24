@@ -6,6 +6,10 @@ from pydantic import BaseModel
 from redis import Redis
 from dotenv import load_dotenv
 load_dotenv()
+from supabase import create_client, Client
+from fastapi import Depends
+from .auth import verify_supabase_jwt
+from .supabase_client import supabase
 
 app = FastAPI(title="Usage-Based API Platform", version="0.1.0")
 app.add_middleware(
@@ -32,6 +36,10 @@ class AnalyzeIn(BaseModel):
 @app.get("/v1/health")
 def health():
     return {"ok": True, "env": os.getenv("APP_ENV", "dev")}
+#A Protected "me" endpoint to demo Supabase JWT verification (Sprint 1) ---
+@app.get("/v1/me")
+def me(user=Depends(verify_supabase_jwt)):
+    return {"user_id": user.get("sub"), "email": user.get("email")}
 
 
 # --- Product API endpoint (will be protected by API keys next) ---
@@ -56,13 +64,34 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
 
 # --- Billing: create Stripe Checkout Session (subscription) ---
 @app.post("/v1/billing/checkout-session")
-def create_checkout_session():
+def create_checkout_session(user=Depends(verify_supabase_jwt)):
     if not PRICE_ID:
         raise HTTPException(status_code=500, detail="Missing STRIPE_PRICE_ID in env")
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase server client not configured")
 
-    # NOTE: in Sprint 1 we’ll attach this to an authenticated user + Stripe customer.
+    user_id = user.get("sub")
+    email = user.get("email")
+
+    # 1) Upsert app user
+    existing = supabase.table("app_users").select("*").eq("id", user_id).execute()
+    row = existing.data[0] if existing.data else None
+
+    if not row:
+        supabase.table("app_users").insert({"id": user_id, "email": email}).execute()
+        row = {"id": user_id, "email": email, "stripe_customer_id": None}
+
+    # 2) Ensure Stripe customer exists
+    stripe_customer_id = row.get("stripe_customer_id")
+    if not stripe_customer_id:
+        customer = stripe.Customer.create(email=email, metadata={"supabase_user_id": user_id})
+        stripe_customer_id = customer["id"]
+        supabase.table("app_users").update({"stripe_customer_id": stripe_customer_id}).eq("id", user_id).execute()
+
+    # 3) Create Checkout Session tied to customer
     session = stripe.checkout.Session.create(
         mode="subscription",
+        customer=stripe_customer_id,
         line_items=[{"price": PRICE_ID, "quantity": 1}],
         success_url=f"{WEB_BASE_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{WEB_BASE_URL}/billing/cancel",
