@@ -9,6 +9,8 @@ services:
       context: ./apps/api
     env_file:
       - ./apps/api/.env
+    environment:
+      PYTHONPATH: /app
     depends_on:
       - redis
     ports:
