@@ -1,4 +1,5 @@
 import os
+import hashlib
 from datetime import datetime, timezone
 
 import stripe
@@ -10,6 +11,7 @@ from redis import Redis
 
 from .auth import verify_supabase_jwt
 from .supabase_client import supabase
+from .api_keys import create_api_key_for_user
 
 load_dotenv()
 
@@ -35,7 +37,6 @@ WEB_BASE_URL = os.getenv("WEB_BASE_URL", "http://localhost:3000")
 
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "")
 if not STRIPE_PRICE_ID:
-    # Fail fast so you don't debug mysterious Stripe errors later
     raise RuntimeError("Missing STRIPE_PRICE_ID in environment")
 
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
@@ -45,6 +46,10 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 # ----------------------------
 class AnalyzeIn(BaseModel):
     text: str
+
+
+class CreateApiKeyIn(BaseModel):
+    name: str | None = None
 
 
 # ----------------------------
@@ -57,7 +62,6 @@ def _ts_to_iso(ts: int | None):
 
 
 def upsert_subscription_row(user_id: str, sub: dict):
-    # sub is a Stripe subscription object (dict)
     price_id = None
     try:
         items = sub.get("items", {}).get("data", [])
@@ -75,12 +79,74 @@ def upsert_subscription_row(user_id: str, sub: dict):
         "current_period_end": _ts_to_iso(sub.get("current_period_end")),
     }
 
-    # Upsert by stripe_subscription_id
     return (
         supabase.table("subscriptions")
         .upsert(payload, on_conflict="stripe_subscription_id")
         .execute()
     )
+
+
+def _hash_api_key(raw_key: str) -> str:
+    # MUST match api_keys.hash_key() (SHA256)
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def require_api_key(authorization: str | None) -> dict:
+    """
+    Expect: Authorization: Bearer <api_key>
+    Returns api_keys row if valid.
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+        raise HTTPException(status_code=401, detail="Invalid Authorization format")
+
+    raw_key = parts[1].strip()
+    key_hash = _hash_api_key(raw_key)
+
+    r = (
+        supabase.table("api_keys")
+        .select("id,user_id,is_active")
+        .eq("key_hash", key_hash)
+        .limit(1)
+        .execute()
+    )
+
+    if not r.data:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    row = r.data[0]
+    if row.get("is_active") is False:
+        raise HTTPException(status_code=403, detail="API key is disabled")
+
+    return row
+
+
+def user_has_active_subscription(user_id: str) -> bool:
+    """
+    Returns True if the user has at least one subscription
+    with status active or trialing.
+    """
+    r = (
+        supabase.table("subscriptions")
+        .select("status")
+        .eq("user_id", user_id)
+        .execute()
+    )
+
+    if not r.data:
+        return False
+
+    allowed_statuses = {"active", "trialing"}
+
+    for row in r.data:
+        status = (row.get("status") or "").strip().lower()
+        if status in allowed_statuses:
+            return True
+
+    return False
 
 
 # ----------------------------
@@ -91,22 +157,43 @@ def health():
     return {"ok": True, "env": os.getenv("APP_ENV", "dev")}
 
 
-# Protected endpoint to verify auth wiring
 @app.get("/v1/me")
 def me(user=Depends(verify_supabase_jwt)):
     return {"user_id": user.get("sub"), "email": user.get("email")}
 
 
+@app.post("/v1/api-keys")
+def create_api_key(payload: CreateApiKeyIn, user=Depends(verify_supabase_jwt)):
+    user_id = user.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid auth session")
+    # IMPORTANT: the *real* key is only returned here (not stored in DB)
+    return create_api_key_for_user(user_id, payload.name)
+
+
 @app.post("/v1/analyze")
-def analyze(payload: AnalyzeIn):
+def analyze(
+    payload: AnalyzeIn,
+    authorization: str | None = Header(default=None),
+):
+    # Step 4: enforce API key
+    key_row = require_api_key(authorization)
+    user_id = key_row["user_id"]
+
+    # Step A: enforce active subscription
+    if not user_has_active_subscription(user_id):
+        raise HTTPException(status_code=402, detail="Active subscription required")
+
     if not payload.text.strip():
         raise HTTPException(status_code=400, detail="text is required")
 
-    # Placeholder usage counter (we’ll tie to user + Stripe later)
+    # Tie usage to the API key owner
     redis_client.incr("usage:requests_total")
+    redis_client.incr(f"usage:user:{user_id}:requests_total")
 
     word_count = len(payload.text.split())
     char_count = len(payload.text)
+
     return {
         "result": {"word_count": word_count, "char_count": char_count},
         "request_id": redis_client.incr("req:id"),
@@ -125,7 +212,6 @@ def create_checkout_session(user=Depends(verify_supabase_jwt)):
     if not user_id or not email:
         raise HTTPException(status_code=401, detail="Invalid auth session")
 
-    # 1) Upsert app user
     existing = supabase.table("app_users").select("*").eq("id", user_id).execute()
     row = existing.data[0] if existing.data else None
 
@@ -133,7 +219,6 @@ def create_checkout_session(user=Depends(verify_supabase_jwt)):
         supabase.table("app_users").insert({"id": user_id, "email": email}).execute()
         row = {"id": user_id, "email": email, "stripe_customer_id": None}
 
-    # 2) Ensure Stripe customer exists
     stripe_customer_id = row.get("stripe_customer_id")
     if not stripe_customer_id:
         customer = stripe.Customer.create(
@@ -144,7 +229,6 @@ def create_checkout_session(user=Depends(verify_supabase_jwt)):
             {"stripe_customer_id": stripe_customer_id}
         ).eq("id", user_id).execute()
 
-    # 3) Create Checkout Session tied to customer + include metadata for webhook mapping
     session = stripe.checkout.Session.create(
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
@@ -176,19 +260,18 @@ async def stripe_webhook(
         )
     except Exception as e:
         raise HTTPException(
-            status_code=400, detail=f"Webhook signature verification failed: {str(e)}"
+            status_code=400,
+            detail=f"Webhook signature verification failed: {str(e)}",
         )
 
     event_type = event["type"]
 
-    # 1) Checkout completed → fetch subscription → upsert in DB
     if event_type == "checkout.session.completed":
         session = event["data"]["object"]
         user_id = (session.get("metadata") or {}).get("user_id")
         customer_id = session.get("customer")
         subscription_id = session.get("subscription")
 
-        # Fallback: map via customer_id → app_users
         if not user_id and customer_id:
             r = (
                 supabase.table("app_users")
@@ -211,9 +294,12 @@ async def stripe_webhook(
             upsert_subscription_row(user_id, sub)
             return {"received": True, "type": event_type}
 
-        return {"received": True, "type": event_type, "note": "No subscription on session"}
+        return {
+            "received": True,
+            "type": event_type,
+            "note": "No subscription on session",
+        }
 
-    # 2) Subscription updated/deleted → update DB row
     if event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
         sub = event["data"]["object"]
         customer_id = sub.get("customer")
@@ -235,5 +321,4 @@ async def stripe_webhook(
 
         return {"received": True, "type": event_type}
 
-    # Ignore other events for now
     return {"received": True, "type": event_type}
