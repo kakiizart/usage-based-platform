@@ -3,213 +3,446 @@
 import { useEffect, useMemo, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 
+import { Button } from "@/components/ui/button";
+import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import StatusIndicator from "@/components/ui/status-indicator";
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
+
+type UsageResponse = {
+  month: string;
+  used: number;
+  quota: number;
+  remaining: number;
+  has_active_subscription: boolean;
+};
+
+type OutputState = {
+  route?: string;
+  status: number;
+  sent?: Record<string, unknown>;
+  json: unknown;
+};
+
+type StatusState = "active" | "idle" | "down" | "fixing";
+
 export default function Home() {
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL!;
-  const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-  const SUPABASE_ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-
-  // Create supabase client once
-  const supabase = useMemo(() => createClient(SUPABASE_URL, SUPABASE_ANON), [SUPABASE_URL, SUPABASE_ANON]);
 
   const [text, setText] = useState("Hello usage-based API");
-  const [out, setOut] = useState<any>(null);
   const [apiKey, setApiKey] = useState("");
+  const [out, setOut] = useState<OutputState | null>(null);
+  const [usage, setUsage] = useState<UsageResponse | null>(null);
 
-  // Load saved API key on first render
+  const [loadingUsage, setLoadingUsage] = useState(false);
+  const [creatingKey, setCreatingKey] = useState(false);
+  const [runningAnalyze, setRunningAnalyze] = useState(false);
+  const [startingCheckout, setStartingCheckout] = useState(false);
+
+  // Load saved key on first render
   useEffect(() => {
     const saved = window.localStorage.getItem("ubp_api_key") || "";
     setApiKey(saved);
   }, []);
 
-  // Save API key whenever it changes
+  // Save key whenever it changes
   useEffect(() => {
     window.localStorage.setItem("ubp_api_key", apiKey);
   }, [apiKey]);
 
-  async function getSupabaseAccessToken(): Promise<string | null> {
+  // Auto-refresh usage whenever API key changes
+  useEffect(() => {
+    const key = apiKey.trim();
+    if (!key) {
+      setUsage(null);
+      return;
+    }
+
+    void loadUsage(key);
+  }, [apiKey]);
+
+  const usagePercent = useMemo(() => {
+    if (!usage || usage.quota <= 0) return 0;
+    return Math.min((usage.used / usage.quota) * 100, 100);
+  }, [usage]);
+
+  const subscriptionStatus = useMemo<{
+    state: StatusState;
+    label: string;
+  }>(() => {
+    if (!usage) {
+      return { state: "idle", label: "Usage not loaded yet" };
+    }
+
+    if (!usage.has_active_subscription) {
+      return { state: "down", label: "No active subscription" };
+    }
+
+    if (usage.remaining <= 0) {
+      return { state: "down", label: "Quota depleted" };
+    }
+
+    if (usage.used / usage.quota >= 0.5) {
+      return { state: "idle", label: "Halfway used" };
+    }
+
+    return { state: "active", label: "Active subscription" };
+  }, [usage]);
+
+  async function getSupabaseJwt(): Promise<string | null> {
     const {
       data: { session },
-      error,
     } = await supabase.auth.getSession();
 
-    if (error) {
-      console.error("supabase.auth.getSession error:", error);
-      return null;
-    }
     return session?.access_token ?? null;
   }
 
-  async function runAnalyze() {
-    setOut(null);
+  async function loadUsage(overrideKey?: string) {
+    const key = (overrideKey ?? apiKey).trim();
 
-    const key = (window.localStorage.getItem("ubp_api_key") || "").trim();
+    if (!key) {
+      setUsage(null);
+      setOut({
+        route: "/v1/usage",
+        status: 401,
+        sent: {
+          url: `${API_BASE}/v1/usage`,
+          hasKey: false,
+          authHeaderSet: false,
+        },
+        json: { detail: "No API key provided" },
+      });
+      return;
+    }
 
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-    if (key) headers["Authorization"] = `Bearer ${key}`;
+    setLoadingUsage(true);
 
-    // Debug
-    console.log("[analyze] API_BASE:", API_BASE);
-    console.log("[analyze] url:", `${API_BASE}/v1/analyze`);
-    console.log("[analyze] hasKey:", Boolean(key));
-    console.log("[analyze] authHeaderSet:", Boolean(headers["Authorization"]));
+    try {
+      const res = await fetch(`${API_BASE}/v1/usage`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${key}`,
+        },
+      });
 
-    const res = await fetch(`${API_BASE}/v1/analyze`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ text }),
-    });
+      const json = await res.json().catch(() => ({}));
 
-    const json = await res.json().catch(() => ({}));
-    setOut({
-      route: "/v1/analyze",
-      status: res.status,
-      sent: {
-        url: `${API_BASE}/v1/analyze`,
-        hasKey: Boolean(key),
-        authHeaderSet: Boolean(headers["Authorization"]),
-      },
-      json,
-    });
+      setOut({
+        route: "/v1/usage",
+        status: res.status,
+        sent: {
+          url: `${API_BASE}/v1/usage`,
+          hasKey: Boolean(key),
+          authHeaderSet: true,
+        },
+        json,
+      });
+
+      if (res.ok) {
+        setUsage(json as UsageResponse);
+      } else {
+        setUsage(null);
+      }
+    } finally {
+      setLoadingUsage(false);
+    }
   }
 
   async function createApiKey() {
+    setCreatingKey(true);
     setOut(null);
 
-    const accessToken = await getSupabaseAccessToken();
-    if (!accessToken) {
+    try {
+      const jwt = await getSupabaseJwt();
+
+      if (!jwt) {
+        setOut({
+          route: "/v1/api-keys",
+          status: 401,
+          sent: {
+            url: `${API_BASE}/v1/api-keys`,
+            authHeaderSet: false,
+            authType: "Supabase JWT",
+          },
+          json: { detail: "No Supabase session found. Please log in again." },
+        });
+        return;
+      }
+
+      const res = await fetch(`${API_BASE}/v1/api-keys`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ name: "dev key" }),
+      });
+
+      const json = await res.json().catch(() => ({}));
+
       setOut({
         route: "/v1/api-keys",
-        status: 401,
-        json: { detail: "No Supabase session found. Please log in again." },
+        status: res.status,
+        sent: {
+          url: `${API_BASE}/v1/api-keys`,
+          authHeaderSet: true,
+          authType: "Supabase JWT",
+        },
+        json,
       });
-      return;
+
+      if (res.ok && json?.api_key) {
+        const newKey = String(json.api_key);
+        setApiKey(newKey);
+        window.localStorage.setItem("ubp_api_key", newKey);
+        await loadUsage(newKey);
+      }
+    } finally {
+      setCreatingKey(false);
     }
+  }
 
-    // Debug
-    console.log("[createApiKey] url:", `${API_BASE}/v1/api-keys`);
-    console.log("[createApiKey] hasSupabaseJWT:", Boolean(accessToken));
+  async function runAnalyze() {
+    setRunningAnalyze(true);
+    setOut(null);
 
-    const res = await fetch(`${API_BASE}/v1/api-keys`, {
-      method: "POST",
-      headers: {
+    try {
+      const key = (window.localStorage.getItem("ubp_api_key") || "").trim();
+
+      const headers: Record<string, string> = {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${accessToken}`, // <-- Supabase JWT (NOT api key)
-      },
-      body: JSON.stringify({ name: "dev key" }),
-    });
+      };
 
-    const json = await res.json().catch(() => ({}));
+      if (key) headers["Authorization"] = `Bearer ${key}`;
 
-    // Your backend returns: { api_key: "...", prefix: "..." }
-    if (res.ok && json?.api_key) {
-      setApiKey(json.api_key);
-      window.localStorage.setItem("ubp_api_key", json.api_key);
+      const res = await fetch(`${API_BASE}/v1/analyze`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ text }),
+      });
+
+      const json = await res.json().catch(() => ({}));
+
+      setOut({
+        route: "/v1/analyze",
+        status: res.status,
+        sent: {
+          url: `${API_BASE}/v1/analyze`,
+          hasKey: Boolean(key),
+          authHeaderSet: Boolean(headers["Authorization"]),
+        },
+        json,
+      });
+
+      if (res.ok && (json as { usage?: UsageResponse }).usage) {
+        setUsage((json as { usage: UsageResponse }).usage);
+      } else if (key) {
+        await loadUsage(key);
+      }
+    } finally {
+      setRunningAnalyze(false);
     }
-
-    setOut({
-      route: "/v1/api-keys",
-      status: res.status,
-      sent: {
-        url: `${API_BASE}/v1/api-keys`,
-        authHeaderSet: true,
-        authType: "Supabase JWT",
-      },
-      json,
-    });
   }
 
   async function startCheckout() {
+    setStartingCheckout(true);
     setOut(null);
 
-    const accessToken = await getSupabaseAccessToken();
-    if (!accessToken) {
+    try {
+      const jwt = await getSupabaseJwt();
+
+      if (!jwt) {
+        setOut({
+          route: "/v1/billing/checkout-session",
+          status: 401,
+          sent: {
+            url: `${API_BASE}/v1/billing/checkout-session`,
+            authHeaderSet: false,
+            authType: "Supabase JWT",
+          },
+          json: { detail: "No Supabase session found. Please log in again." },
+        });
+        return;
+      }
+
+      const res = await fetch(`${API_BASE}/v1/billing/checkout-session`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+        },
+      });
+
+      const json = await res.json().catch(() => ({}));
+
+      if (json?.url) {
+        window.location.href = json.url;
+        return;
+      }
+
       setOut({
         route: "/v1/billing/checkout-session",
-        status: 401,
-        json: { detail: "No Supabase session found. Please log in again." },
+        status: res.status,
+        sent: {
+          url: `${API_BASE}/v1/billing/checkout-session`,
+          authHeaderSet: true,
+          authType: "Supabase JWT",
+        },
+        json,
       });
-      return;
+    } finally {
+      setStartingCheckout(false);
     }
-
-    // Debug
-    console.log("[checkout] url:", `${API_BASE}/v1/billing/checkout-session`);
-    console.log("[checkout] hasSupabaseJWT:", Boolean(accessToken));
-
-    const res = await fetch(`${API_BASE}/v1/billing/checkout-session`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`, // <-- Supabase JWT (NOT api key)
-      },
-    });
-
-    const json = await res.json().catch(() => ({}));
-
-    if (res.ok && json?.url) {
-      window.location.href = json.url;
-      return;
-    }
-
-    setOut({
-      route: "/v1/billing/checkout-session",
-      status: res.status,
-      sent: {
-        url: `${API_BASE}/v1/billing/checkout-session`,
-        authHeaderSet: true,
-        authType: "Supabase JWT",
-      },
-      json,
-    });
   }
 
   return (
-    <main style={{ padding: 24, maxWidth: 760 }}>
-      <h1 style={{ fontSize: 28, fontWeight: 700 }}>Usage-Based API Platform</h1>
-      <p>API key → /v1/analyze. Supabase JWT → /v1/api-keys + /v1/billing/checkout-session.</p>
+    <main className="mx-auto max-w-5xl space-y-8 px-6 py-8">
+      <section className="space-y-2">
+        <h1 className="text-4xl font-bold tracking-tight">
+          Usage-Based API Platform
+        </h1>
+        <p className="text-muted-foreground">
+          API key → /v1/analyze. Supabase JWT → /v1/api-keys + /v1/billing/checkout-session.
+        </p>
+      </section>
 
-      <div style={{ marginTop: 16 }}>
-        <label style={{ display: "block", fontWeight: 600, marginBottom: 6 }}>API Key (dev-only)</label>
-        <input
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          placeholder="ubp_..."
-          style={{ width: "100%", padding: 12 }}
-        />
-        <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
-          Saved locally as <code>ubp_api_key</code>.
+      <section className="grid gap-6 lg:grid-cols-2">
+        <div className="space-y-6 rounded-xl border bg-card p-6">
+          <div className="space-y-2">
+            <h2 className="text-xl font-semibold">Developer Access</h2>
+            <p className="text-sm text-muted-foreground">
+              Manage your dev API key and use it for protected API calls.
+            </p>
+          </div>
+
+          <Field>
+            <FieldLabel htmlFor="api-key-input">API Key (dev-only)</FieldLabel>
+            <Input
+              id="api-key-input"
+              type="text"
+              placeholder="ubp_..."
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+            />
+            <FieldDescription>
+              Saved locally as <code>ubp_api_key</code>.
+            </FieldDescription>
+          </Field>
+
+          <div className="flex flex-wrap gap-3">
+            <Button onClick={createApiKey} disabled={creatingKey}>
+              {creatingKey ? "Creating..." : "Create API Key"}
+            </Button>
+
+            <Button variant="outline" onClick={() => loadUsage()} disabled={loadingUsage}>
+              {loadingUsage ? "Refreshing usage..." : "Refresh Usage"}
+            </Button>
+          </div>
+
+          <Field>
+            <FieldLabel htmlFor="analyze-text">Analyze Text</FieldLabel>
+            <textarea
+              id="analyze-text"
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              rows={5}
+              className="flex min-h-[140px] w-full rounded-lg border bg-transparent px-3 py-2 text-sm outline-none"
+            />
+            <FieldDescription>
+              Send text to <code>/v1/analyze</code> using the current API key.
+            </FieldDescription>
+          </Field>
+
+          <div className="flex flex-wrap gap-3">
+            <Button onClick={runAnalyze} disabled={runningAnalyze}>
+              {runningAnalyze ? "Calling..." : "Call /v1/analyze"}
+            </Button>
+
+            <Button
+              variant="outline"
+              onClick={startCheckout}
+              disabled={startingCheckout}
+            >
+              {startingCheckout ? "Starting..." : "Start Stripe Checkout"}
+            </Button>
+          </div>
         </div>
 
-        <div style={{ display: "flex", gap: 12, marginTop: 12 }}>
-          <button onClick={createApiKey} style={{ padding: "10px 14px" }}>
-            Create API Key
-          </button>
-        </div>
-      </div>
+        <div className="space-y-6 rounded-xl border bg-card p-6">
+          <div className="space-y-2">
+            <h2 className="text-xl font-semibold">Subscription & Usage</h2>
+            <p className="text-sm text-muted-foreground">
+              Live usage state from <code>/v1/usage</code>.
+            </p>
+          </div>
 
-      <div style={{ marginTop: 16 }}>
-        <textarea value={text} onChange={(e) => setText(e.target.value)} rows={4} style={{ width: "100%", padding: 12 }} />
-        <div style={{ display: "flex", gap: 12, marginTop: 12 }}>
-          <button onClick={runAnalyze} style={{ padding: "10px 14px" }}>
-            Call /v1/analyze
-          </button>
-          <button onClick={startCheckout} style={{ padding: "10px 14px" }}>
-            Start Stripe Checkout
-          </button>
-        </div>
-      </div>
+          <div className="rounded-lg border p-4">
+            <StatusIndicator
+              state={subscriptionStatus.state}
+              label={subscriptionStatus.label}
+            />
+          </div>
 
-      <pre
-        style={{
-          marginTop: 16,
-          background: "#111",
-          color: "#0f0",
-          padding: 12,
-          overflow: "auto",
-        }}
-      >
-        {out ? JSON.stringify(out, null, 2) : "Output..."}
-      </pre>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="rounded-lg border p-4">
+              <div className="text-sm text-muted-foreground">Current month</div>
+              <div className="mt-2 text-2xl font-semibold">
+                {usage?.month ?? "--"}
+              </div>
+            </div>
+
+            <div className="rounded-lg border p-4">
+              <div className="text-sm text-muted-foreground">Usage</div>
+              <div className="mt-2 text-2xl font-semibold">
+                {usage ? `${usage.used} / ${usage.quota}` : "-- / --"}
+              </div>
+            </div>
+
+            <div className="rounded-lg border p-4">
+              <div className="text-sm text-muted-foreground">Remaining</div>
+              <div className="mt-2 text-2xl font-semibold">
+                {usage?.remaining ?? "--"}
+              </div>
+            </div>
+
+            <div className="rounded-lg border p-4">
+              <div className="text-sm text-muted-foreground">Subscription</div>
+              <div className="mt-2 text-2xl font-semibold">
+                {usage ? (usage.has_active_subscription ? "Active" : "Inactive") : "--"}
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-2 rounded-lg border p-4">
+            <div className="flex items-center justify-between text-sm text-muted-foreground">
+              <span>Quota usage</span>
+              <span>{Math.round(usagePercent)}%</span>
+            </div>
+            <div className="h-3 w-full overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-foreground transition-all"
+                style={{ width: `${usagePercent}%` }}
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="rounded-xl border bg-card p-6">
+        <div className="mb-3 space-y-1">
+          <h2 className="text-xl font-semibold">API Response</h2>
+          <p className="text-sm text-muted-foreground">
+            Latest response from the platform.
+          </p>
+        </div>
+
+        <pre className="overflow-auto rounded-lg bg-black p-4 text-sm text-green-400">
+          {out ? JSON.stringify(out, null, 2) : "Output..."}
+        </pre>
+      </section>
     </main>
   );
 }

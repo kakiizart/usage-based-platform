@@ -41,6 +41,8 @@ if not STRIPE_PRICE_ID:
 
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
+MONTHLY_REQUEST_QUOTA = int(os.getenv("MONTHLY_REQUEST_QUOTA", "100"))
+
 # ----------------------------
 # Models
 # ----------------------------
@@ -87,7 +89,6 @@ def upsert_subscription_row(user_id: str, sub: dict):
 
 
 def _hash_api_key(raw_key: str) -> str:
-    # MUST match api_keys.hash_key() (SHA256)
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
@@ -149,6 +150,33 @@ def user_has_active_subscription(user_id: str) -> bool:
     return False
 
 
+def get_usage_bucket() -> str:
+    """
+    Returns a YYYY-MM bucket, e.g. 2026-03.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def get_user_monthly_usage_key(user_id: str) -> str:
+    return f"usage:user:{user_id}:month:{get_usage_bucket()}:requests_total"
+
+
+def get_user_monthly_usage(user_id: str) -> int:
+    value = redis_client.get(get_user_monthly_usage_key(user_id))
+    return int(value) if value else 0
+
+
+def enforce_monthly_quota(user_id: str) -> None:
+    current_usage = get_user_monthly_usage(user_id)
+
+    if current_usage >= MONTHLY_REQUEST_QUOTA:
+        raise HTTPException(status_code=429, detail="Monthly usage quota exceeded")
+
+
+def increment_user_monthly_usage(user_id: str) -> int:
+    return redis_client.incr(get_user_monthly_usage_key(user_id))
+
+
 # ----------------------------
 # Routes
 # ----------------------------
@@ -167,7 +195,6 @@ def create_api_key(payload: CreateApiKeyIn, user=Depends(verify_supabase_jwt)):
     user_id = user.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid auth session")
-    # IMPORTANT: the *real* key is only returned here (not stored in DB)
     return create_api_key_for_user(user_id, payload.name)
 
 
@@ -176,20 +203,20 @@ def analyze(
     payload: AnalyzeIn,
     authorization: str | None = Header(default=None),
 ):
-    # Step 4: enforce API key
     key_row = require_api_key(authorization)
     user_id = key_row["user_id"]
 
-    # Step A: enforce active subscription
     if not user_has_active_subscription(user_id):
         raise HTTPException(status_code=402, detail="Active subscription required")
+
+    enforce_monthly_quota(user_id)
 
     if not payload.text.strip():
         raise HTTPException(status_code=400, detail="text is required")
 
-    # Tie usage to the API key owner
     redis_client.incr("usage:requests_total")
     redis_client.incr(f"usage:user:{user_id}:requests_total")
+    increment_user_monthly_usage(user_id)
 
     word_count = len(payload.text.split())
     char_count = len(payload.text)
@@ -197,8 +224,32 @@ def analyze(
     return {
         "result": {"word_count": word_count, "char_count": char_count},
         "request_id": redis_client.incr("req:id"),
+        "usage": {
+            "month": get_usage_bucket(),
+            "used": get_user_monthly_usage(user_id),
+            "quota": MONTHLY_REQUEST_QUOTA,
+        },
     }
 
+
+@app.get("/v1/usage")
+def get_usage(
+    authorization: str | None = Header(default=None),
+):
+    key_row = require_api_key(authorization)
+    user_id = key_row["user_id"]
+
+    has_active = user_has_active_subscription(user_id)
+    used = get_user_monthly_usage(user_id)
+    remaining = max(MONTHLY_REQUEST_QUOTA - used, 0)
+
+    return {
+        "month": get_usage_bucket(),
+        "used": used,
+        "quota": MONTHLY_REQUEST_QUOTA,
+        "remaining": remaining,
+        "has_active_subscription": has_active,
+    }
 
 @app.post("/v1/billing/checkout-session")
 def create_checkout_session(user=Depends(verify_supabase_jwt)):
