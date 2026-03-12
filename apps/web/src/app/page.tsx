@@ -3,10 +3,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 
-import { Button } from "@/components/ui/button";
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
+import { MorphyButton } from "@/components/ui/morphy-button";
 import StatusIndicator from "@/components/ui/status-indicator";
+
+import { mockRecentFiles } from "@/lib/mock-recent-files";
+import { RecentFilesStepper } from "@/components/files/recent-files-stepper";
+import { RecentFilesSearch } from "@/components/files/recent-files-search";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -33,6 +36,7 @@ type StatusState = "active" | "idle" | "down" | "fixing";
 export default function Home() {
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL!;
 
+  const [fileQuery, setFileQuery] = useState("");
   const [text, setText] = useState("Hello usage-based API");
   const [apiKey, setApiKey] = useState("");
   const [out, setOut] = useState<OutputState | null>(null);
@@ -43,18 +47,31 @@ export default function Home() {
   const [runningAnalyze, setRunningAnalyze] = useState(false);
   const [startingCheckout, setStartingCheckout] = useState(false);
 
-  // Load saved key on first render
+  const filteredRecentFiles = useMemo(() => {
+    const q = fileQuery.trim().toLowerCase();
+
+    if (!q) return mockRecentFiles;
+
+    return mockRecentFiles.filter((file) => {
+      return (
+        file.name.toLowerCase().includes(q) ||
+        file.label.toLowerCase().includes(q) ||
+        file.extension.toLowerCase().includes(q)
+      );
+    });
+  }, [fileQuery]);
+
+  const isSearchingFiles = fileQuery.trim().length > 0;
+
   useEffect(() => {
     const saved = window.localStorage.getItem("ubp_api_key") || "";
     setApiKey(saved);
   }, []);
 
-  // Save key whenever it changes
   useEffect(() => {
     window.localStorage.setItem("ubp_api_key", apiKey);
   }, [apiKey]);
 
-  // Auto-refresh usage whenever API key changes
   useEffect(() => {
     const key = apiKey.trim();
     if (!key) {
@@ -195,8 +212,8 @@ export default function Home() {
         json,
       });
 
-      if (res.ok && json?.api_key) {
-        const newKey = String(json.api_key);
+      if (res.ok && (json as { api_key?: string })?.api_key) {
+        const newKey = String((json as { api_key: string }).api_key);
         setApiKey(newKey);
         window.localStorage.setItem("ubp_api_key", newKey);
         await loadUsage(newKey);
@@ -278,8 +295,8 @@ export default function Home() {
 
       const json = await res.json().catch(() => ({}));
 
-      if (json?.url) {
-        window.location.href = json.url;
+      if ((json as { url?: string })?.url) {
+        window.location.href = String((json as { url: string }).url);
         return;
       }
 
@@ -305,7 +322,8 @@ export default function Home() {
           Usage-Based API Platform
         </h1>
         <p className="text-muted-foreground">
-          API key → /v1/analyze. Supabase JWT → /v1/api-keys + /v1/billing/checkout-session.
+          API key → /v1/analyze. Supabase JWT → /v1/api-keys +
+          /v1/billing/checkout-session.
         </p>
       </section>
 
@@ -320,12 +338,13 @@ export default function Home() {
 
           <Field>
             <FieldLabel htmlFor="api-key-input">API Key (dev-only)</FieldLabel>
-            <Input
+            <input
               id="api-key-input"
               type="text"
               placeholder="ubp_..."
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
+              className="flex h-10 w-full rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none"
             />
             <FieldDescription>
               Saved locally as <code>ubp_api_key</code>.
@@ -333,13 +352,17 @@ export default function Home() {
           </Field>
 
           <div className="flex flex-wrap gap-3">
-            <Button onClick={createApiKey} disabled={creatingKey}>
+            <MorphyButton onClick={createApiKey} disabled={creatingKey}>
               {creatingKey ? "Creating..." : "Create API Key"}
-            </Button>
+            </MorphyButton>
 
-            <Button variant="outline" onClick={() => loadUsage()} disabled={loadingUsage}>
-              {loadingUsage ? "Refreshing usage..." : "Refresh Usage"}
-            </Button>
+            <MorphyButton
+              animate="reverse"
+              onClick={() => loadUsage()}
+              disabled={loadingUsage}
+            >
+              {loadingUsage ? "Refreshing..." : "Refresh Usage"}
+            </MorphyButton>
           </div>
 
           <Field>
@@ -349,7 +372,7 @@ export default function Home() {
               value={text}
               onChange={(e) => setText(e.target.value)}
               rows={5}
-              className="flex min-h-[140px] w-full rounded-lg border bg-transparent px-3 py-2 text-sm outline-none"
+              className="flex min-h-[140px] w-full rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none"
             />
             <FieldDescription>
               Send text to <code>/v1/analyze</code> using the current API key.
@@ -357,17 +380,22 @@ export default function Home() {
           </Field>
 
           <div className="flex flex-wrap gap-3">
-            <Button onClick={runAnalyze} disabled={runningAnalyze}>
+            <MorphyButton
+              size="lg"
+              onClick={runAnalyze}
+              disabled={runningAnalyze}
+            >
               {runningAnalyze ? "Calling..." : "Call /v1/analyze"}
-            </Button>
+            </MorphyButton>
 
-            <Button
-              variant="outline"
+            <MorphyButton
+              size="lg"
+              animate="reverse"
               onClick={startCheckout}
               disabled={startingCheckout}
             >
               {startingCheckout ? "Starting..." : "Start Stripe Checkout"}
-            </Button>
+            </MorphyButton>
           </div>
         </div>
 
@@ -411,7 +439,11 @@ export default function Home() {
             <div className="rounded-lg border p-4">
               <div className="text-sm text-muted-foreground">Subscription</div>
               <div className="mt-2 text-2xl font-semibold">
-                {usage ? (usage.has_active_subscription ? "Active" : "Inactive") : "--"}
+                {usage
+                  ? usage.has_active_subscription
+                    ? "Active"
+                    : "Inactive"
+                  : "--"}
               </div>
             </div>
           </div>
@@ -429,6 +461,19 @@ export default function Home() {
             </div>
           </div>
         </div>
+      </section>
+
+      <section className="mt-8 grid gap-6 lg:grid-cols-2">
+        <RecentFilesStepper
+          files={filteredRecentFiles}
+          paused={isSearchingFiles}
+        />
+
+        <RecentFilesSearch
+          query={fileQuery}
+          onQueryChange={setFileQuery}
+          results={filteredRecentFiles}
+        />
       </section>
 
       <section className="rounded-xl border bg-card p-6">
